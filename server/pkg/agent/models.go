@@ -303,6 +303,16 @@ func ListModels(ctx context.Context, providerType string, runtimeCmd Command) (C
 		// ModelSelectionSupported. Return an empty list rather than spawning
 		// an ACP subprocess that can only ever come back empty.
 		return Catalog{Models: []Model{}}, nil
+	case "zcode":
+		// ZCode's model catalog is advertised by the zcode-acp-server bridge
+		// over ACP via session/new configOptions (see discoverZcodeModels).
+		// Enumeration needs a signed-in ZCode behind the bridge; discovery
+		// failures degrade to an empty catalog so the UI keeps manual entry
+		// available.
+		return cachedDiscovery(discoveryCacheKey(providerType, runtimeCmd), func() (Catalog, error) {
+			models, err := discoverZcodeModels(ctx, runtimeCmd)
+			return Catalog{Models: models}, err
+		})
 	default:
 		return Catalog{}, fmt.Errorf("unknown agent type: %q", providerType)
 	}
