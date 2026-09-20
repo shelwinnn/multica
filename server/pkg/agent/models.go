@@ -303,6 +303,16 @@ func ListModels(ctx context.Context, providerType string, runtimeCmd Command) (C
 		// ModelSelectionSupported. Return an empty list rather than spawning
 		// an ACP subprocess that can only ever come back empty.
 		return Catalog{Models: []Model{}}, nil
+	case "zcode":
+		// ZCode's model catalog is advertised by the zcode-acp-server bridge
+		// over ACP via session/new configOptions (see discoverZcodeModels).
+		// Enumeration needs a signed-in ZCode behind the bridge; discovery
+		// failures degrade to an empty catalog so the UI keeps manual entry
+		// available.
+		return cachedDiscovery(discoveryCacheKey(providerType, runtimeCmd), func() (Catalog, error) {
+			models, err := discoverZcodeModels(ctx, runtimeCmd)
+			return Catalog{Models: models}, err
+		})
 	default:
 		return Catalog{}, fmt.Errorf("unknown agent type: %q", providerType)
 	}
@@ -1600,6 +1610,121 @@ func annotateHermesDiscoveryUnconfigured(err error) error {
 //
 // Failure modes (kimi missing, not logged in, config error) return an empty
 // list so the UI falls back to manual entry.
+
+// discoverZcodeModels enumerates the model catalog advertised by the
+// zcode-acp-server bridge over ACP via session/new configOptions (option id
+// `model`). Any failure returns an empty catalog (Fallback) so the model
+// picker keeps manual entry available.
+//
+// The bridge MUST be spawned bare. It dispatches on its invoked basename:
+// launched as the `zcode-acp-server` bin name it ignores argv and speaks ACP
+// stdio, but the daemon resolves the real dist/cli.js path, and THAT spelling
+// parses every positional as a subcommand — the shared helper's default `acp`
+// made it print usage and exit before initialize, which discovery reported as
+// a silently empty catalog (verified against 0.37.1: `cli.js acp` → "unknown
+// command 'acp'"). Bare `cli.js` falls back to ACP server mode on non-TTY
+// stdio, the same invocation the backend's Execute path uses.
+func discoverZcodeModels(ctx context.Context, runtimeCmd Command) ([]Model, error) {
+	// The picker must describe the desktop's real catalog, so keep the
+	// bridge's provider store current before spawning it here too (the
+	// backend's Execute path syncs as well; discovery bypasses Execute).
+	syncZcodeBridgeProviderConfig(zcodeBridgeHomeDir(nil), slog.Default())
+	return discoverACPModels(ctx, runtimeCmd, acpDiscoveryProvider{
+		defaultBin:     "zcode-acp-server",
+		clientName:     "multica-model-discovery",
+		tmpdirPrefix:   "multica-zcode-discovery-",
+		bareInvocation: true,
+		annotate: func(models []Model, sessionResult json.RawMessage) {
+			option, ok := parseACPEffortOption(sessionResult)
+			if !ok || len(option.Choices) == 0 {
+				return
+			}
+			thinking := &ModelThinking{
+				SupportedLevels: option.Choices,
+				DefaultLevel:    option.CurrentValue,
+			}
+			current := acpModelOptionCurrentValue(sessionResult)
+			for i := range models {
+				if current == "" || models[i].ID == current {
+					models[i].Thinking = thinking
+				}
+			}
+		},
+	})
+}
+
+// resolveACPModelValue maps a persisted model string onto the exact value of
+// the session's advertised `model` config option, reporting whether it
+// rewrote anything. Bridges like zcode-acp-server advertise encoded
+// `provider\model` values while agent.model holds whatever was persisted — a
+// display-case bare id ("GLM-5.3-Flash") from manual entry or an older
+// catalog — and the bridge resolves a bare id against ITS config store, not
+// the live session, so an unrewritten bare id can target a provider the
+// runtime no longer knows. Match order:
+//
+//   - the requested string already is an advertised value → unchanged;
+//   - else, case-insensitive match of the bare model id (the segment after
+//     each value's `\` separator) against the requested bare id. Exactly one
+//     match rewrites; zero or several pass through verbatim, leaving the
+//     runtime's own rejection as the loud, honest failure.
+func resolveACPModelValue(raw json.RawMessage, requested string) (string, bool) {
+	requested = strings.TrimSpace(requested)
+	if requested == "" || len(raw) == 0 {
+		return requested, false
+	}
+	candidates := parseACPConfigOptionModels(raw)
+	for _, m := range candidates {
+		if m.ID == requested {
+			return requested, false
+		}
+	}
+	requestedBare := requested
+	if idx := strings.LastIndex(requestedBare, `\`); idx >= 0 {
+		requestedBare = requestedBare[idx+1:]
+	}
+	var matches []string
+	for _, m := range candidates {
+		bare := m.ID
+		if idx := strings.LastIndex(bare, `\`); idx >= 0 {
+			bare = bare[idx+1:]
+		}
+		if strings.EqualFold(bare, requestedBare) {
+			matches = append(matches, m.ID)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], true
+	}
+	return requested, false
+}
+
+// acpModelOptionCurrentValue reads the `model` config option's currentValue
+// out of an ACP session/new response — the encoded id of the model whose
+// per-session options the response describes. Empty when absent.
+func acpModelOptionCurrentValue(raw json.RawMessage) string {
+	type acpOption struct {
+		ID           string `json:"id"`
+		CurrentValue string `json:"currentValue"`
+	}
+	var resp struct {
+		ConfigOptions      []acpOption `json:"configOptions"`
+		ConfigOptionsSnake []acpOption `json:"config_options"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return ""
+	}
+	options := resp.ConfigOptions
+	if len(options) == 0 {
+		options = resp.ConfigOptionsSnake
+	}
+	for _, opt := range options {
+		if opt.ID == "model" {
+			return opt.CurrentValue
+		}
+	}
+	return ""
+}
+
 func discoverKimiModels(ctx context.Context, runtimeCmd Command) ([]Model, error) {
 	var acpVersion string
 	models, err := discoverACPModels(ctx, runtimeCmd, acpDiscoveryProvider{
@@ -1938,6 +2063,14 @@ type acpDiscoveryProvider struct {
 	// acpArgs is the argv passed to the binary to start it in ACP
 	// server mode. Defaults to []string{"acp"} when nil/empty.
 	acpArgs []string
+	// bareInvocation spawns the binary with no argv at all. Some ACP servers
+	// have no subcommand to begin with AND reject unknown positionals —
+	// zcode-acp-server dispatches on its invoked basename and parses any
+	// argument as a subcommand, so a default "acp" positional makes it print
+	// usage and exit before initialize. Set this instead of acpArgs when the
+	// provider needs NO launch arguments; acpArgs stays the escape hatch for
+	// providers whose subcommand carries arguments (grok agent stdio).
+	bareInvocation bool
 	// selectAuthMethod inspects the initialize response and child environment
 	// after initialize succeeds. A non-nil selector must return one advertised
 	// method id; its error aborts discovery before any session operation.
@@ -2007,7 +2140,7 @@ func discoverACPModels(ctx context.Context, runtimeCmd Command, p acpDiscoveryPr
 	}
 
 	cmdArgs := p.acpArgs
-	if len(cmdArgs) == 0 {
+	if len(cmdArgs) == 0 && !p.bareInvocation {
 		cmdArgs = []string{"acp"}
 	}
 	cmd := runtimeCmd.exec(runCtx, cmdArgs...)
