@@ -651,15 +651,12 @@ function CommentRow({
 
   const reactions = entry.reactions ?? [];
 
-  if (isDeletedComment(entry)) {
-    // Kept only so the replies to it stay attached (#8296): nothing is left
-    // to show or act on.
-    return (
-      <div data-comment-block className="py-3 pl-12 pr-4 max-md:pl-3 max-md:pr-3 text-body italic text-muted-foreground">
-        {t(($) => $.comment.deleted_placeholder)}
-      </div>
-    );
-  }
+  // A deleted reply renders nothing at all. Its row is kept only so the
+  // replies to it keep a direct parent (#8296), and the thread renders those
+  // replies flat, in its place — a placeholder row would say nothing they do
+  // not already say. Callers drop this row's chrome too, so the thread shows
+  // no empty divider where it was.
+  if (isDeletedComment(entry)) return null;
 
   return (
     <div data-comment-block className="pb-3">
@@ -837,6 +834,7 @@ function CommentRow({
               <CommentTriggerChips
                 agents={edit.triggerPreview.agents}
                 blocked={edit.triggerPreview.blocked}
+                hasAllMembersMention={edit.triggerPreview.hasAllMembersMention}
                 draftContent={edit.content}
                 suppressedAgentIds={edit.suppressedAgentIds}
                 onToggle={edit.toggleSuppressedAgent}
@@ -902,14 +900,20 @@ export function AgentRunComment({ run, standalone = false, commentProps, enterin
   commentProps?: CommentCardProps;
 }) {
   const viewState = useInlineCommentRunState();
-  const reply = commentProps?.entry;
+  const replyEntry = commentProps?.entry;
+  // A deleted reply renders nothing in a run slot either (see CommentRow), so
+  // the slot falls back to the run's own activity block: the run happened, and
+  // it still carries `hasReply`, so it never prints the deleted body as its
+  // output. A deleted thread ROOT keeps rendering — it heads its own thread.
+  const replyHidden = !standalone && !!replyEntry && isDeletedComment(replyEntry);
+  const reply = replyHidden ? undefined : replyEntry;
   const motionRef = useRunCommentMotion(entering, reply?.id, run.task.status);
   return (
     <div ref={motionRef} data-run-slot-id={run.task.id}
       data-run-comment-id={!reply ? run.task.id : undefined}
       id={!standalone && reply ? `comment-${reply.id}` : undefined}
       className={cn(standalone ? !reply && "rounded-xl border bg-card" : "border-t border-border/50", !reply && "py-1.5", reply && commentProps?.highlightedCommentId === reply.id && highlightedCommentBackgroundClass)}>
-      {commentProps ? standalone ? (
+      {commentProps && reply ? standalone ? (
         <CommentCard {...commentProps} runs={commentProps.runs ?? [run]} runViewState={viewState} />
       ) : (
         <CommentRow {...commentProps}
@@ -990,6 +994,11 @@ function CommentCardImpl({
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   const allNestedReplies = replies;
+  // What the thread shows. Tombstones are excluded from display and counts but
+  // stay in `allNestedReplies`, which run anchoring and "has replies" reason
+  // over. Every tombstone has at least one live descendant (the server prunes
+  // one that loses its last reply), so no content hides behind this.
+  const visibleReplies = allNestedReplies.filter((reply) => !isDeletedComment(reply));
   const slottedReplyIds = new Set(runs.filter((run) => run.hasReply && run.anchorCommentId && run.commentId !== entry.id)
     .map((run) => run.commentId));
   const renderRuns = (commentId: string, presentation: "inline" | "header" = "inline") => runs.filter((run) => run.commentId === commentId && run.hasReply
@@ -1007,7 +1016,7 @@ function CommentCardImpl({
       } : undefined} />{reply && reply.id !== commentId && renderAnchoredRuns(reply.id)}</Fragment>;
     });
 
-  const replyCount = allNestedReplies.length;
+  const replyCount = visibleReplies.length;
   const repliedToIds = new Set(allNestedReplies.map((reply) => reply.parent_id));
   const deleted = isDeletedComment(entry);
   const contentPreview = (entry.content ?? "").replace(/\n/g, " ").slice(0, 80);
@@ -1024,8 +1033,8 @@ function CommentCardImpl({
   const threadExpanded = !!expandedResolvedIds?.has(entry.id);
   const replyFolded = replyResolutionId != null && !threadExpanded;
   const foldedReplies = replyResolutionId
-    ? allNestedReplies.filter((r) => r.id !== replyResolutionId)
-    : allNestedReplies;
+    ? visibleReplies.filter((r) => r.id !== replyResolutionId)
+    : visibleReplies;
   const resolutionReply = replyResolutionId
     ? allNestedReplies.find((r) => r.id === replyResolutionId) ?? null
     : null;
@@ -1276,6 +1285,7 @@ function CommentCardImpl({
                     <CommentTriggerChips
                       agents={edit.triggerPreview.agents}
                       blocked={edit.triggerPreview.blocked}
+                      hasAllMembersMention={edit.triggerPreview.hasAllMembersMention}
                       draftContent={edit.content}
                       suppressedAgentIds={edit.suppressedAgentIds}
                       onToggle={edit.toggleSuppressedAgent}
@@ -1397,30 +1407,34 @@ function CommentCardImpl({
               {/* Replies — chronological; the resolution keeps its place with a badge */}
               {allNestedReplies.filter((reply) => !slottedReplyIds.has(reply.id)).map((reply) => (
                 <Fragment key={reply.id}>
-                  <div
-                    id={`comment-${reply.id}`}
-                    className={cn(
-                      "border-t border-border/50 transition-colors duration-700",
-                      highlightedCommentId === reply.id && highlightedCommentBackgroundClass,
-                    )}
-                  >
-                    <CommentRow
-                      issueId={issueId}
-                      entry={reply}
-                      runHeader={renderRuns(reply.id, "header")}
-                      runMetadata={renderRuns(reply.id)}
-                      currentUserId={currentUserId}
-                      canModerate={canModerate}
-                      isResolution={reply.id === replyResolutionId}
-                      isHighlighted={highlightedCommentId === reply.id}
-                      hasReplies={repliedToIds.has(reply.id)}
-                      onEdit={onEdit}
-                      onDelete={onDelete}
-                      onToggleReaction={onToggleReaction}
-                      onCreateSubIssue={onCreateSubIssue}
-                      onResolveToggle={onResolveToggle}
-                    />
-                  </div>
+                  {/* A tombstone keeps its place in the walk — runs anchored to
+                      it still render — but contributes no row of its own. */}
+                  {!isDeletedComment(reply) && (
+                    <div
+                      id={`comment-${reply.id}`}
+                      className={cn(
+                        "border-t border-border/50 transition-colors duration-700",
+                        highlightedCommentId === reply.id && highlightedCommentBackgroundClass,
+                      )}
+                    >
+                      <CommentRow
+                        issueId={issueId}
+                        entry={reply}
+                        runHeader={renderRuns(reply.id, "header")}
+                        runMetadata={renderRuns(reply.id)}
+                        currentUserId={currentUserId}
+                        canModerate={canModerate}
+                        isResolution={reply.id === replyResolutionId}
+                        isHighlighted={highlightedCommentId === reply.id}
+                        hasReplies={repliedToIds.has(reply.id)}
+                        onEdit={onEdit}
+                        onDelete={onDelete}
+                        onToggleReaction={onToggleReaction}
+                        onCreateSubIssue={onCreateSubIssue}
+                        onResolveToggle={onResolveToggle}
+                      />
+                    </div>
+                  )}
                   {renderAnchoredRuns(reply.id)}
                 </Fragment>
               ))}

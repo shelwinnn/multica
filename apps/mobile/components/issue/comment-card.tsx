@@ -33,7 +33,10 @@ import Animated, {
 } from "react-native-reanimated";
 import { Ionicons } from "@expo/vector-icons";
 import type { Reaction, TimelineEntry } from "@multica/core/types";
-import { isDeletedComment } from "@multica/core/issues/comment-deletion";
+import {
+  commentLandingTarget,
+  isDeletedComment,
+} from "@multica/core/issues/comment-deletion";
 import { Text } from "@/components/ui/text";
 import { ActorAvatar } from "@/components/ui/actor-avatar";
 import { useActorLookup } from "@/data/use-actor-name";
@@ -127,6 +130,16 @@ export function CommentCard({
     }
   }, [resolved, highlightedCommentId, entry.id, replies]);
 
+  const visibleReplies = replies.filter((reply) => !isDeletedComment(reply));
+  // A deleted reply renders nothing, so a notification pointing at one has no
+  // row to flash. Flash the comment just above where it was instead — the
+  // expansion above still keys off the original id, which is in this thread
+  // either way. Web does the same in its deep-link effect
+  // (packages/views/issues/components/issue-detail.tsx).
+  const highlightId = highlightedCommentId
+    ? commentLandingTarget(highlightedCommentId, entry.id, replies)
+    : highlightedCommentId;
+
   if (resolved && !expanded) {
     return (
       <ResolvedThreadBar
@@ -174,7 +187,12 @@ export function CommentCard({
             issueIdentifier={issueIdentifier}
             onPressChange={handlePressChange}
           />
-          {replies.map((reply) => (
+          {/* A deleted reply renders nothing: its row is kept only so its own
+           *  replies keep a direct parent (#8296), and this list is flat, so
+           *  they already render in its place. Mirrors the reply list in
+           *  packages/views/issues/components/comment-card.tsx. A deleted ROOT
+           *  still renders its placeholder — it heads the thread. */}
+          {visibleReplies.map((reply) => (
             <View key={reply.id} className="border-t border-border/60 pt-3">
               <CommentBody
                 entry={reply}
@@ -183,12 +201,12 @@ export function CommentCard({
                 onPressChange={handlePressChange}
               />
               <ReplyHighlightOverlay
-                active={highlightedCommentId === reply.id}
+                active={highlightId === reply.id}
               />
             </View>
           ))}
         </View>
-        <RootHighlightOverlay active={highlightedCommentId === entry.id} />
+        <RootHighlightOverlay active={highlightId === entry.id} />
       </View>
     </View>
   );
@@ -244,7 +262,9 @@ function ResolvedThreadBar({
     return remaining > 0 ? `${named} +${remaining}` : named;
   }, [entry, replies, getName]);
 
-  const total = 1 + replies.length;
+  // Deleted replies render nothing when the thread expands, so the folded
+  // count must not promise them either.
+  const total = 1 + replies.filter((reply) => !isDeletedComment(reply)).length;
 
   return (
     <View className="px-4">
@@ -488,9 +508,10 @@ function CommentBody({
   }, [longPress.isPressed, entry.id, isSelecting, onPressChange]);
 
   if (isDeletedComment(entry)) {
-    // Kept only so the replies to it stay attached (#8296): no author, body
-    // or long-press actions. Mirrors CommentRow's placeholder in
-    // packages/views/issues/components/comment-card.tsx.
+    // Only a deleted thread ROOT reaches this — the card filters deleted
+    // replies out. The root keeps a placeholder because its replies hang off
+    // it and the thread would otherwise have no head. Mirrors the root
+    // placeholder in packages/views/issues/components/comment-card.tsx.
     return (
       <Text className="text-sm italic text-muted-foreground">
         This comment was deleted

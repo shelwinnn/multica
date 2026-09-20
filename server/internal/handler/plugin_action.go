@@ -77,7 +77,7 @@ func (h *Handler) requirePluginActionV1(w http.ResponseWriter, r *http.Request) 
 	if h.pluginsV1Enabled(r.Context()) {
 		return true
 	}
-	publicapiv1.WriteProblem(w, r, http.StatusServiceUnavailable, "plugin_api_disabled", "Plugin management is not enabled")
+	publicapiv1.WriteProblem(w, r, http.StatusForbidden, "plugin_api_disabled", "Plugin management is not enabled")
 	return false
 }
 
