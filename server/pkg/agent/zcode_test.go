@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +43,11 @@ while IFS= read -r line; do
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Internal error","data":{"details":"zcode create failed: timeout"}}}\n' "$id"
         exit 0
       fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_zc_new","configOptions":[{"id":"model","currentValue":"glm-5.3"},{"id":"thought","category":"thought_level","currentValue":"max","options":[{"value":"low","name":"low"},{"value":"high","name":"high"},{"value":"max","name":"max"}]}]}}\n' "$id"
+      if [ "$ZC_MODEL_CATALOG" = "1" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_zc_new","configOptions":[{"id":"model","currentValue":"bigmodel\\\\glm-5.2","options":[{"value":"bigmodel\\\\glm-5.2","name":"GLM-5.2"},{"value":"bigmodel\\\\glm-5.3-flash","name":"GLM-5.3-Flash"}]},{"id":"thought","category":"thought_level","currentValue":"max","options":[{"value":"low","name":"low"},{"value":"high","name":"high"},{"value":"max","name":"max"}]}]}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_zc_new","configOptions":[{"id":"model","currentValue":"glm-5.3"},{"id":"thought","category":"thought_level","currentValue":"max","options":[{"value":"low","name":"low"},{"value":"high","name":"high"},{"value":"max","name":"max"}]}]}}\n' "$id"
+      fi
       ;;
     *'"method":"session/set_config_option"'*)
       requested=$(printf '%s' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
@@ -98,7 +104,11 @@ func runZcodeTest(t *testing.T, env map[string]string, opts ExecOptions) (*Resul
 	fakePath := filepath.Join(dir, "zcode-acp-server")
 	writeTestExecutable(t, fakePath, []byte(fakeZcodeACPScript()))
 
-	testEnv := map[string]string{"ZC_ARGC_FILE": filepath.Join(dir, "argc")}
+	testEnv := map[string]string{
+		"ZC_ARGC_FILE": filepath.Join(dir, "argc"),
+		// Keep the provider-config sync out of the developer's real ~/.zcode.
+		"HOME": dir,
+	}
 	for k, v := range env {
 		testEnv[k] = v
 	}
@@ -150,7 +160,7 @@ func TestZcodeBackendLaunchesBridgeWithoutSubcommand(t *testing.T) {
 	backend, err := New("zcode", Config{
 		ExecutablePath: fakePath,
 		Logger:         slog.Default(),
-		Env:            map[string]string{"ZC_ARGC_FILE": argcFile},
+		Env:            map[string]string{"ZC_ARGC_FILE": argcFile, "HOME": dir},
 	})
 	if err != nil {
 		t.Fatalf("new zcode backend: %v", err)
@@ -239,6 +249,52 @@ func TestZcodeBackendSetModelFailureFailsTask(t *testing.T) {
 	}
 }
 
+// TestZcodeBackendResolvesPersistedModelAgainstCatalog pins the id rewrite
+// before session/setModel: the bridge only accepts the encoded
+// `provider\model` values it advertised, and resolves a bare id against its
+// config store rather than the live session (verified live — setModel
+// "GLM-5.3-Flash" rejects with "model switch rejected" while
+// "bigmodel\glm-5.3-flash" succeeds), so a display-case bare pick from an
+// older catalog or manual entry must be resolved against the session's own
+// catalog first.
+func TestZcodeBackendResolvesPersistedModelAgainstCatalog(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	requestsFile := filepath.Join(dir, "requests")
+	result, _ := runZcodeTest(t, map[string]string{
+		"ZC_MODEL_CATALOG": "1",
+		"ZC_REQUESTS_FILE": requestsFile,
+	}, ExecOptions{
+		Model: "GLM-5.3-Flash",
+	})
+	if result.Status != "completed" {
+		t.Fatalf("expected status=completed, got %q (error=%q)", result.Status, result.Error)
+	}
+	raw, err := os.ReadFile(requestsFile)
+	if err != nil {
+		t.Fatalf("read requests file: %v", err)
+	}
+	sawSetModel := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.Contains(line, `"method":"session/setModel"`) {
+			continue
+		}
+		sawSetModel = true
+		// The wire carries the JSON-escaped backslash: bigmodel\\glm-5.3-flash.
+		if strings.Contains(line, "bigmodel\\\\glm-5.3-flash") {
+			return
+		}
+		if strings.Contains(line, `"GLM-5.3-Flash"`) {
+			t.Fatalf("setModel sent the bare display-case id verbatim: %s", line)
+		}
+		t.Fatalf("setModel carried neither the resolved nor the bare id: %s", line)
+	}
+	if !sawSetModel {
+		t.Fatal("no session/setModel request was recorded")
+	}
+}
+
 // TestZcodeBackendSetModelSessionNotFoundClearsSessionID covers the resumed
 // session dying before the model switch: the id must be cleared and
 // ResumeRejected set so the daemon retries fresh instead of looping on a
@@ -312,6 +368,7 @@ func TestZcodeBackendSendsGracefulCancel(t *testing.T) {
 			"ZC_ARGC_FILE":     filepath.Join(dir, "argc"),
 			"ZC_REQUESTS_FILE": requestsFile,
 			"ZC_HANG":          "1",
+			"HOME":             dir,
 		},
 	})
 	if err != nil {
@@ -455,7 +512,7 @@ func TestZcodeBackendAppliesThinkingLevel(t *testing.T) {
 	backend, err := New("zcode", Config{
 		ExecutablePath: fakePath,
 		Logger:         slog.Default(),
-		Env:            map[string]string{"ZC_REQUESTS_FILE": requestsFile},
+		Env:            map[string]string{"ZC_REQUESTS_FILE": requestsFile, "HOME": dir},
 	})
 	if err != nil {
 		t.Fatalf("new zcode backend: %v", err)
@@ -488,5 +545,213 @@ func TestZcodeBackendAppliesThinkingLevel(t *testing.T) {
 	}
 	if !strings.Contains(requests, `"configId":"thought"`) || !strings.Contains(requests, `"value":"high"`) {
 		t.Errorf("expected the advertised option id and verbatim value, got:\n%s", requests)
+	}
+}
+
+// desktopConfigFixture mirrors the ZCode desktop >= 3.11 provider store
+// (~/.zcode/cli/config.json): a keyed BigModel Coding Plan, a keyless Z.AI
+// Coding Plan entry (the shape that makes the bridge push an unauthenticatable
+// provider into the runtime's registry), and a keyless localhost provider.
+func desktopConfigFixture() string {
+	return `{
+  "model": {"main": "bigmodel/glm-5.2"},
+  "plugins": {},
+  "provider": {
+    "zai": {
+      "kind": "anthropic",
+      "name": "Z.AI Coding Plan",
+      "options": {"apiKeyRequired": true, "baseURL": "https://open.bigmodel.cn/api/anthropic"},
+      "models": {"glm-5.3": {"name": "GLM-5.3"}}
+    },
+    "bigmodel": {
+      "kind": "anthropic",
+      "name": "BigModel Coding Plan",
+      "options": {"apiKey": "bm-key", "baseURL": "https://open.bigmodel.cn/api/anthropic"},
+      "models": {"glm-5.2": {"name": "GLM-5.2"}, "glm-5.3-flash": {"name": "GLM-5.3-Flash"}}
+    },
+    "local-llama": {
+      "kind": "openai-compatible",
+      "name": "Local",
+      "options": {"baseURL": "http://127.0.0.1:11434/v1"},
+      "models": {"llama": {"name": "Llama"}}
+    }
+  }
+}`
+}
+
+// readSyncedProviders returns the provider map of the synced bridge config.
+func readSyncedProviders(t *testing.T, dir string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, ".zcode", "v2", "config.json"))
+	if err != nil {
+		t.Fatalf("read synced config: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse synced config: %v", err)
+	}
+	if cfg[zcodeManagedConfigKey] != true {
+		t.Error("synced config is missing the managed marker")
+	}
+	providers, _ := cfg["provider"].(map[string]any)
+	return providers
+}
+
+// TestSyncZcodeBridgeProviderConfig pins the desktop→bridge mirror: the sync
+// keeps only providers that can authenticate (the keyless Z.AI entry made the
+// runtime fail every default-model turn with provider_not_configured),
+// preserves the desktop's other top-level keys, and never touches a
+// destination it does not own.
+func TestSyncZcodeBridgeProviderConfig(t *testing.T) {
+	t.Parallel()
+
+	writeDesktopConfig := func(t *testing.T, dir, content string) {
+		t.Helper()
+		cliDir := filepath.Join(dir, ".zcode", "cli")
+		if err := os.MkdirAll(cliDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cliDir, "config.json"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("creates a filtered copy from the desktop store", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		writeDesktopConfig(t, dir, desktopConfigFixture())
+
+		syncZcodeBridgeProviderConfig(dir, slog.Default())
+
+		providers := readSyncedProviders(t, dir)
+		if _, ok := providers["bigmodel"]; !ok {
+			t.Error("keyed bigmodel provider was dropped")
+		}
+		if _, ok := providers["local-llama"]; !ok {
+			t.Error("keyless localhost provider was dropped")
+		}
+		if _, ok := providers["zai"]; ok {
+			t.Error("keyless zai provider must be dropped: it fails every default-model turn")
+		}
+		// Non-provider top-level keys survive the round-trip.
+		raw, err := os.ReadFile(filepath.Join(dir, ".zcode", "v2", "config.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cfg map[string]any
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := cfg["model"]; !ok {
+			t.Error("desktop's model key was not preserved")
+		}
+	})
+
+	t.Run("rewrites a managed copy whose source changed", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		writeDesktopConfig(t, dir, desktopConfigFixture())
+		syncZcodeBridgeProviderConfig(dir, slog.Default())
+
+		// The desktop grants the zai plan a key: the next sync must pick it up.
+		updated := strings.Replace(desktopConfigFixture(),
+			`"apiKeyRequired": true, "baseURL": "https://open.bigmodel.cn/api/anthropic"`,
+			`"apiKey": "zai-key", "baseURL": "https://open.bigmodel.cn/api/anthropic"`, 1)
+		writeDesktopConfig(t, dir, updated)
+		syncZcodeBridgeProviderConfig(dir, slog.Default())
+
+		if _, ok := readSyncedProviders(t, dir)["zai"]; !ok {
+			t.Error("zai provider should sync once it has credentials")
+		}
+	})
+
+	t.Run("leaves a foreign-managed destination alone", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		writeDesktopConfig(t, dir, desktopConfigFixture())
+		dstDir := filepath.Join(dir, ".zcode", "v2")
+		if err := os.MkdirAll(dstDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		foreign := `{"provider": {"bigmodel": {"options": {"apiKey": "old"}}}}`
+		dst := filepath.Join(dstDir, "config.json")
+		if err := os.WriteFile(dst, []byte(foreign), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		syncZcodeBridgeProviderConfig(dir, slog.Default())
+
+		raw, err := os.ReadFile(dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != foreign {
+			t.Error("sync rewrote a destination it does not manage")
+		}
+	})
+
+	t.Run("does nothing without a desktop store", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		syncZcodeBridgeProviderConfig(dir, slog.Default())
+		if _, err := os.Stat(filepath.Join(dir, ".zcode", "v2", "config.json")); !os.IsNotExist(err) {
+			t.Error("sync wrote a config without a desktop source")
+		}
+	})
+}
+
+// TestDiscoverZcodeModelsLaunchesBridgeWithoutSubcommand pins the discovery
+// launch contract: the daemon resolves the bridge's real dist/cli.js path, and
+// THAT invocation parses positionals as subcommands — the shared helper's
+// default `acp` made the bridge print usage and exit before initialize, which
+// discovery silently reported as an empty catalog ("暂无可用模型").
+func TestDiscoverZcodeModelsLaunchesBridgeWithoutSubcommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake binary requires a POSIX shell")
+	}
+	// The discovery entry point syncs the bridge's provider store; keep it
+	// away from the developer's real ~/.zcode.
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	argcFile := filepath.Join(dir, "argc")
+	// The discovery helper spawns the fake with the process env, so the argc
+	// probe writes next to the script instead of relying on a knob variable.
+	script := `#!/bin/sh
+printf '%s\n' "$#" >> "$(dirname "$0")/argc"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"zcode-acp-server","version":"0.37.1"}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_disc","configOptions":[{"id":"model","category":"model","currentValue":"bigmodel\\\\glm-4.7","options":[{"value":"bigmodel\\\\glm-4.7","name":"GLM-4.7"},{"value":"bigmodel\\\\glm-5.3-flash","name":"GLM-5.3-Flash"}]}]}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+	fake := filepath.Join(dir, "zcode-acp-server")
+	writeTestExecutable(t, fake, []byte(script))
+
+	models, err := discoverZcodeModels(context.Background(), Command{Path: fake})
+	if err != nil {
+		t.Fatalf("discoverZcodeModels: %v", err)
+	}
+	raw, err := os.ReadFile(argcFile)
+	if err != nil {
+		t.Fatalf("read argc file: %v", err)
+	}
+	for _, n := range strings.Fields(strings.TrimSpace(string(raw))) {
+		if n != "0" {
+			t.Errorf("discovery spawned the bridge with %s args; the bridge dispatches argv[0] positionals as subcommands and must be launched bare", n)
+		}
+	}
+	if len(models) != 2 {
+		t.Fatalf("expected 2 advertised models, got %d (%v)", len(models), models)
+	}
+	if models[0].ID != `bigmodel\glm-4.7` || models[1].ID != `bigmodel\glm-5.3-flash` {
+		t.Errorf("unexpected catalog ids: %q, %q", models[0].ID, models[1].ID)
 	}
 }

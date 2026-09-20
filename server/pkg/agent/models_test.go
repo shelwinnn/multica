@@ -1921,3 +1921,83 @@ func TestModelSelectorMustBeProviderQualifiedIsAnExecutionContract(t *testing.T)
 		})
 	}
 }
+
+// TestResolveACPModelValue pins the bare-id resolution the zcode backend
+// applies before session/setModel: bridges advertise encoded `provider\model`
+// values while agent.model can hold a display-case bare id, and the bridge
+// resolves bare ids against its config store rather than the live session —
+// so only the advertised spelling is guaranteed to switch.
+func TestResolveACPModelValue(t *testing.T) {
+	t.Parallel()
+
+	catalog := json.RawMessage(`{"configOptions":[{"id":"model","currentValue":"bigmodel\\glm-5.2","options":[
+		{"value":"bigmodel\\glm-5.2","name":"GLM-5.2"},
+		{"value":"bigmodel\\glm-4.7","name":"GLM-4.7"},
+		{"value":"bigmodel\\glm-5-turbo","name":"GLM-5-Turbo"},
+		{"value":"bigmodel\\glm-5.3","name":"GLM-5.3"},
+		{"value":"bigmodel\\glm-5.3-flash","name":"GLM-5.3-Flash"}]}]}`)
+
+	tests := []struct {
+		name      string
+		raw       json.RawMessage
+		requested string
+		want      string
+		rewritten bool
+	}{
+		{
+			name:      "exact advertised value passes through unrewritten",
+			raw:       catalog,
+			requested: `bigmodel\glm-5.3-flash`,
+			want:      `bigmodel\glm-5.3-flash`,
+		},
+		{
+			name:      "display-case bare id resolves to the advertised value",
+			raw:       catalog,
+			requested: "GLM-5.3-Flash",
+			want:      `bigmodel\glm-5.3-flash`,
+			rewritten: true,
+		},
+		{
+			name:      "provider-qualified but wrong case resolves too",
+			raw:       catalog,
+			requested: `bigmodel\GLM-5.3-Flash`,
+			want:      `bigmodel\glm-5.3-flash`,
+			rewritten: true,
+		},
+		{
+			name:      "unknown bare id passes through verbatim",
+			raw:       catalog,
+			requested: "GLM-9",
+			want:      "GLM-9",
+		},
+		{
+			name: "ambiguous bare id across providers passes through verbatim",
+			raw: json.RawMessage(`{"configOptions":[{"id":"model","options":[
+				{"value":"alpha\\m1","name":"M1"},{"value":"beta\\m1","name":"M1"}]}]}`),
+			requested: "M1",
+			want:      "M1",
+		},
+		{
+			name:      "empty requested is a no-op",
+			raw:       catalog,
+			requested: "",
+			want:      "",
+		},
+		{
+			name:      "session without a model catalog is a no-op",
+			raw:       json.RawMessage(`{"sessionId":"s"}`),
+			requested: "GLM-5.3-Flash",
+			want:      "GLM-5.3-Flash",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, rewritten := resolveACPModelValue(tt.raw, tt.requested)
+			if got != tt.want || rewritten != tt.rewritten {
+				t.Errorf("resolveACPModelValue(%q) = (%q, %v), want (%q, %v)",
+					tt.requested, got, rewritten, tt.want, tt.rewritten)
+			}
+		})
+	}
+}

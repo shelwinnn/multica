@@ -1,11 +1,16 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -28,6 +33,205 @@ var zcodeBlockedArgs = map[string]blockedArgMode{
 // machinery kill whatever is still alive. A var, not a const, so tests can
 // shorten it.
 var zcodeCancelWaitDelay = 10 * time.Second
+
+// zcodeManagedConfigKey marks ~/.zcode/v2/config.json as written by
+// syncZcodeBridgeProviderConfig. The bridge only reads the file, so an extra
+// key is inert to it; the key exists so the sync never touches a copy managed
+// by anything else.
+const zcodeManagedConfigKey = "_multicaManaged"
+
+// zcodeBridgeHomeDir resolves the HOME the spawned bridge will see — the
+// bridge derives ~/.zcode from its own env (HOME, then USERPROFILE), so the
+// mirror must resolve the same root from cfg.Env first. Empty when neither is
+// set, which disables the sync.
+func zcodeBridgeHomeDir(env map[string]string) string {
+	if h := strings.TrimSpace(env["HOME"]); h != "" {
+		return h
+	}
+	if h := strings.TrimSpace(env["USERPROFILE"]); h != "" {
+		return h
+	}
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return h
+}
+
+// syncZcodeBridgeProviderConfig mirrors the desktop app's provider
+// configuration into the path zcode-acp-server reads, so the CLI-driven
+// runtime uses the same providers, models, and plan credentials as the
+// desktop.
+//
+// ZCode desktop >= 3.11 keeps its provider/model store (apiKeys, model
+// catalogs, reasoning variants) in ~/.zcode/cli/config.json, while the bridge
+// still reads the pre-3.11 location ~/.zcode/v2/config.json. When that file
+// is missing, every model-related bridge feature degrades: the catalog falls
+// back to a single hardcoded model, the provider-registry push fails, and
+// session/setModel is always rejected. A verbatim copy is harmful in its own
+// way, though: the store also lists providers without credentials (e.g. an
+// unconfigured Z.AI Coding Plan entry), the bridge pushes them into the
+// runtime's provider registry, and a default-model turn then dies with
+// provider_not_configured "Model provider is missing an API key: zai" before
+// any model call is attempted (verified live against bridge 0.37.1/0.43.4
+// driving ZCode CLI 3.11.2 — the newest bridge pushes keyless providers
+// identically).
+//
+// The mirror therefore keeps only providers that can actually authenticate —
+// apiKey present, keys not required, or a localhost baseURL (Ollama-style
+// keyless runtimes) — mirroring the bridge's own providerSelectable rule.
+// Call it wherever the bridge is spawned (backend launch and model discovery)
+// so both the turn path and the picker track the desktop's current
+// configuration; per-launch sync is what keeps the copy from drifting behind
+// a rotated key or an edited model list.
+//
+// Safety: the destination is written only when it is absent or carries the
+// zcodeManagedConfigKey marker. A v2/config.json managed by anything else —
+// the pre-3.11 desktop writes this exact path — is never touched, and if the
+// desktop ever takes the path back, the missing marker makes the sync stand
+// down on its own. Every failure degrades silently to pre-sync behaviour:
+// the bridge still runs, just against whatever the file already says.
+func syncZcodeBridgeProviderConfig(home string, logger *slog.Logger) {
+	if home == "" {
+		return
+	}
+	srcPath := filepath.Join(home, ".zcode", "cli", "config.json")
+	dstPath := filepath.Join(home, ".zcode", "v2", "config.json")
+	srcRaw, err := os.ReadFile(srcPath)
+	if err != nil {
+		return // no desktop-managed source (old desktop, headless-only host)
+	}
+	var src map[string]any
+	if err := json.Unmarshal(srcRaw, &src); err != nil {
+		logger.Debug("zcode bridge config sync: source unreadable; skipping",
+			"component", "zcode", "path", srcPath, "error", err)
+		return
+	}
+	dstRaw, dstErr := os.ReadFile(dstPath)
+	if dstErr == nil {
+		// An unparseable or foreign-managed destination is never clobbered.
+		var existing map[string]any
+		if json.Unmarshal(dstRaw, &existing) != nil {
+			return
+		}
+		if _, managed := existing[zcodeManagedConfigKey]; !managed {
+			return
+		}
+	}
+	providers, _ := src["provider"].(map[string]any)
+	filtered := make(map[string]any, len(providers))
+	for id, raw := range providers {
+		p, ok := raw.(map[string]any)
+		if !ok || !zcodeProviderUsable(id, p) {
+			logger.Debug("zcode bridge config sync: dropping provider without usable credentials",
+				"component", "zcode", "provider", id)
+			continue
+		}
+		filtered[id] = p
+	}
+	out := make(map[string]any, len(src)+1)
+	for k, v := range src {
+		out[k] = v
+	}
+	out["provider"] = filtered
+	out[zcodeManagedConfigKey] = true
+	outRaw, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return
+	}
+	// Deterministic content (no timestamps): an unchanged source rewrites
+	// nothing, so per-launch calls stay read-only in the steady state.
+	if dstErr == nil && bytes.Equal(outRaw, dstRaw) {
+		return
+	}
+	dir := filepath.Dir(dstPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(dir, ".multica-zcode-config-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+	}
+	if _, err := tmp.Write(outRaw); err != nil {
+		cleanup()
+		return
+	}
+	// The copy carries plan API keys — same file the bridge would read them
+	// from, but never loosen the mode on the way through.
+	if err := tmp.Chmod(0o600); err != nil {
+		cleanup()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, dstPath); err != nil {
+		// os.Rename does not replace an existing file on Windows.
+		_ = os.Remove(dstPath)
+		if err := os.Rename(tmpName, dstPath); err != nil {
+			_ = os.Remove(tmpName)
+			return
+		}
+	}
+	logger.Debug("zcode bridge config sync: mirrored desktop provider configuration",
+		"component", "zcode", "providers", len(filtered))
+}
+
+// zcodeProviderUsable reports whether a provider entry from the desktop's
+// config can authenticate a model call. Mirrors the bridge's own
+// providerSelectable rule (dist/config/options.js): builtin entries need
+// enabled + apiKey; everything else is usable unless explicitly disabled and
+// keyless, with local baseURLs (llama.cpp / Ollama / LM Studio) exempt from
+// the key requirement.
+func zcodeProviderUsable(id string, p map[string]any) bool {
+	opts, _ := p["options"].(map[string]any)
+	if opts == nil {
+		return false
+	}
+	hasKey := false
+	if k, ok := opts["apiKey"].(string); ok {
+		hasKey = strings.TrimSpace(k) != ""
+	}
+	if strings.HasPrefix(id, "builtin:") {
+		enabled, _ := p["enabled"].(bool)
+		return enabled && hasKey
+	}
+	if disabled, ok := p["enabled"].(bool); ok && !disabled {
+		return false
+	}
+	if hasKey {
+		return true
+	}
+	if required, ok := opts["apiKeyRequired"].(bool); ok && !required {
+		return true
+	}
+	return zcodeLocalBaseURL(opts["baseURL"])
+}
+
+// zcodeLocalBaseURL reports whether the baseURL points at a loopback host —
+// local inference servers run keyless by design.
+func zcodeLocalBaseURL(raw any) bool {
+	s, ok := raw.(string)
+	if !ok || s == "" {
+		return false
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	default:
+		return false
+	}
+}
 
 // zcodeBackend implements Backend by spawning zcode-acp-server and
 // communicating via the ACP (Agent Client Protocol) JSON-RPC 2.0 over
@@ -83,6 +287,11 @@ type zcodeBackend struct {
 }
 
 func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
+	// Mirror the desktop's provider configuration into the bridge's expected
+	// path before spawning it — a no-op in the steady state, and the reason
+	// the session's providers, models, and plan credentials match what the
+	// ZCode desktop app itself uses.
+	syncZcodeBridgeProviderConfig(zcodeBridgeHomeDir(b.cfg.Env), b.cfg.Logger)
 	execPath := b.cfg.ExecutablePath
 	if execPath == "" {
 		execPath = "zcode-acp-server"
@@ -390,18 +599,31 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		// 3. If the caller picked a model (via agent.model from the UI
 		// dropdown — the catalog comes from the bridge's ACP
 		// configOptions), switch the session to it before sending any
-		// prompt. This MUST fail the task on error: silently falling back
-		// to the bridge's configured default model would let the user
+		// prompt. The persisted id is resolved against the catalog this
+		// very session advertised: the bridge only accepts the encoded
+		// `provider\model` values it listed, while agent.model may hold a
+		// display-case bare id (manual entry, or a pick from an older
+		// catalog) that the bridge would resolve against its config store
+		// and reject. This MUST fail the task on error: silently falling
+		// back to the bridge's configured default model would let the user
 		// believe their pick was honoured while the task ran on something
 		// else.
+		modelID := opts.Model
 		if opts.Model != "" {
+			if resolved, rewritten := resolveACPModelValue(sessionResult, opts.Model); rewritten {
+				b.cfg.Logger.Info("zcode model resolved against the session catalog",
+					"requested_model", opts.Model,
+					"model", resolved,
+				)
+				modelID = resolved
+			}
 			if _, err := c.request(runCtx, "session/setModel", map[string]any{
 				"sessionId": sessionID,
-				"modelId":   opts.Model,
+				"modelId":   modelID,
 			}); err != nil {
-				b.cfg.Logger.Warn("zcode setModel failed", "error", err, "requested_model", opts.Model)
+				b.cfg.Logger.Warn("zcode setModel failed", "error", err, "requested_model", opts.Model, "model", modelID)
 				finalStatus = "failed"
-				finalError = fmt.Sprintf("zcode could not switch to model %q: %v", opts.Model, err)
+				finalError = fmt.Sprintf("zcode could not switch to model %q: %v", modelID, err)
 				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
 					// On a resumed session with a model override, the dead
 					// session can surface here instead of at session/prompt.
@@ -529,7 +751,9 @@ func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		u := c.accumulatedUsage()
 		var usageMap map[string]TokenUsage
 		if acpTokenUsagePresent(u) {
-			key := opts.Model
+			// modelID is the setModel-resolved id — the model the turn
+			// actually ran on, which may differ in spelling from opts.Model.
+			key := modelID
 			if key == "" {
 				key = "unknown"
 			}
